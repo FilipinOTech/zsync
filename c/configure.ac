@@ -31,6 +31,11 @@ AC_CHECK_HEADERS([string.h])
 AC_TYPE_SIZE_T
 AC_CHECK_FUNCS(memcpy pwrite pread mkstemp)
 
+LIBCURL_CHECK_CONFIG([yes], [7.7.2], [], [
+echo "*** libcurl not found ***"
+exit 1
+])
+
 X_TYPE_SOCKLEN_T
 X_TYPE_IN_PORT_T
 X_DECL_H_ERRNO
