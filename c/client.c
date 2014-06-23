@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdbool.h>
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -29,6 +30,7 @@
 #include <sys/types.h>
 #include <sys/stat.h>
 #include <utime.h>
+#include <curl/curl.h>
 
 #ifdef WITH_DMALLOC
 # include <dmalloc.h>
@@ -162,6 +164,150 @@ static void **append_ptrlist(int *n, void **p, void *a) {
     return p;
 }
 
+FILE* http_get(const char* url, const char* zsync_filename)
+{
+    char* partial_filename = NULL;
+    enum { GET_SIMPLE, GET_PARTIAL, GET_NEWER } transfer_type = GET_SIMPLE;
+    FILE* outfile;
+    char error_buf[CURL_ERROR_SIZE];
+    CURL* curlhandle = curl_easy_init(); 
+
+    curl_easy_setopt(curlhandle, CURLOPT_URL, url);
+    curl_easy_setopt(curlhandle, CURLOPT_ERRORBUFFER, error_buf);
+    curl_easy_setopt(curlhandle, CURLOPT_AUTOREFERER, 1);
+    curl_easy_setopt(curlhandle, CURLOPT_FOLLOWLOCATION, 1);
+    curl_easy_setopt(curlhandle, CURLOPT_MAXREDIRS, 1);
+
+    /* If we have a (possibly older or incomplete) copy of this file already,
+     * add a suitable headers to only retrieve new/additional content */
+    if (zsync_filename) {
+        struct stat st;
+
+        /* Construct the name of the incomplete transfer file that would have
+         * been used by a previous transfer */
+        partial_filename = malloc(strlen(zsync_filename) + 6);
+        strcpy(partial_filename, zsync_filename);
+        strcat(partial_filename, ".part");
+
+        /* If we have an incomplete previous transfer, then our complete copy
+         * must be older but the incomplete copy may be current still and we
+         * could continue from that. */
+        if (stat(partial_filename, &st) == 0) {
+            curl_easy_setopt(curlhandle, CURLOPT_RESUME_FROM_LARGE, (curl_off_t)st.st_size);
+            curl_easy_setopt(curlhandle, CURLOPT_TIMECONDITION, CURL_TIMECOND_IFUNMODSINCE);
+            curl_easy_setopt(curlhandle, CURLOPT_TIMEVALUE, st.st_mtime);
+            outfile = fopen(partial_filename, "a+");
+            transfer_type = GET_PARTIAL;
+        }
+        else if (errno == ENOENT && stat(zsync_filename, &st) == 0) {
+            /* Else, if we have a complete possibly-old version, so only transfer
+             * if the remote has newer. */
+            curl_easy_setopt(curlhandle, CURLOPT_TIMECONDITION, CURL_TIMECOND_IFMODSINCE);
+            curl_easy_setopt(curlhandle, CURLOPT_TIMEVALUE, st.st_mtime);
+            outfile = fopen(partial_filename, "w+");
+            transfer_type = GET_NEWER;
+        }
+    }
+
+    /* If we're not making a conditional download, open a file to hold the full download. */
+    if (transfer_type == GET_SIMPLE) {
+        if (partial_filename) {
+            outfile = fopen(partial_filename, "w+");
+        }
+        else {
+            outfile = tmpfile();
+        }
+    }
+
+    if (!outfile) {
+        perror("open");
+        exit(3);
+    }
+
+    /* Now that we have our output file, tell curl to write to it. */
+    curl_easy_setopt(curlhandle, CURLOPT_WRITEFUNCTION, NULL);
+    curl_easy_setopt(curlhandle, CURLOPT_WRITEDATA, outfile);
+
+    {   /* And do the actual transfer. */
+        CURLcode result = curl_easy_perform(curlhandle); 
+
+        if (result) {
+            fprintf(stderr, "could not read control file from URL %s: %s\n", url, error_buf);
+            exit(3);
+        }
+    }
+
+    {
+        long condition_unmet;
+        switch (transfer_type) {
+        case GET_PARTIAL:
+            curl_easy_getinfo(curlhandle, CURLINFO_CONDITION_UNMET, &condition_unmet);
+            if (condition_unmet) {
+                /* The remote has a newer version of the file. Discard our partial transfer. */
+                fclose(outfile);
+                if (unlink(partial_filename) != 0) {
+                    perror("unlink");
+                    exit(3);
+                }
+                free(partial_filename);
+
+                /* We need to send another request; the easiest way to do
+                 * that is start again now that we discarded the partial
+                 * transfer data. */
+                curl_easy_cleanup(curlhandle);
+                return http_get(url, zsync_filename);
+            }
+            break;
+        case GET_NEWER:
+            curl_easy_getinfo(curlhandle, CURLINFO_CONDITION_UNMET, &condition_unmet);
+            fprintf(stderr, "get_newer %ld", condition_unmet);
+
+            /* Condition-not-met here means the remote file was NOT newer. */
+            if (condition_unmet) {
+                /* Our existing version was fine. */
+                /* Discard partial transfer. */
+                fclose(outfile);
+                unlink(partial_filename);
+                free(partial_filename);
+                partial_filename = NULL;
+
+                /* Use existing file. */
+                outfile = fopen(zsync_filename, "r");
+                if (!outfile) {
+                    perror("open");
+                    exit(3);
+                }
+            }
+            break;
+        }
+    }
+
+    /* If we were downloading to a .part file, move it now to the final filename. */
+    if (partial_filename) {
+        if (rename(partial_filename, zsync_filename)) {
+            perror("rename");
+            exit(3);
+        }
+        free(partial_filename);
+    }
+
+    {   /* Record the URL of the .zsync, so we can resolve URLs in it relative
+         * to its location later. */
+        char* tmp_referer;
+        curl_easy_getinfo(curlhandle, CURLINFO_EFFECTIVE_URL, &tmp_referer);
+
+        /* We have to strdup this, as we need to be able to allow the user to
+         * substitute their own URL in the case of local files, and we want to
+         * be able to free() it either way at the end of main(). */
+        referer = strdup(tmp_referer);
+    }
+    curl_easy_cleanup(curlhandle);
+
+    /* Return file handle to the start for reading, and return. */
+    rewind(outfile);
+    return outfile;
+}
+
 /* zs = read_zsync_control_file(location_str, filename)
  * Reads a zsync control file from either a URL or filename specified in
  * location_str. This is treated as a URL if no local file exists of that name
@@ -170,10 +316,9 @@ static void **append_ptrlist(int *n, void **p, void *a) {
  * .zsync _if it is retrieved from a URL_; can be NULL in which case no local
  * copy is made.
  */
-struct zsync_state *read_zsync_control_file(const char *p, const char *fn) {
+struct zsync_state *read_zsync_control_file(const char *p, const char *zsync_filename) {
     FILE *f;
     struct zsync_state *zs;
-    char *lastpath = NULL;
 
     /* Try opening as a local path */
     f = fopen(p, "r");
@@ -184,14 +329,10 @@ struct zsync_state *read_zsync_control_file(const char *p, const char *fn) {
             exit(2);
         }
 
-        /* Try URL fetch */
-        f = http_get(p, &lastpath, fn);
-        if (!f) {
-            fprintf(stderr, "could not read control file from URL %s\n", p);
-            exit(3);
-        }
-        referer = lastpath;
+        /* Try HTTP instead */
+        f = http_get(p, zsync_filename);
     }
+
 
     /* Read the .zsync */
     if ((zs = zsync_begin(f)) == NULL) {
@@ -432,6 +573,8 @@ int main(int argc, char **argv) {
     time_t mtime;
 
     srand(getpid());
+    curl_global_init(CURL_GLOBAL_WIN32 | CURL_GLOBAL_SSL);
+
     {   /* Option parsing */
         int opt;
         while ((opt = getopt(argc, argv, "A:k:o:i:Vsqvu:C:KT:I:R:S:")) != -1) {

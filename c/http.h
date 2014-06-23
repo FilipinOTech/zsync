@@ -29,11 +29,14 @@ extern long use_timeout;
 
 FILE* http_get(const char *orig_url, char **track_referer, const char *tfname);
 
+int set_proxy_from_string(const char* s);
+
 struct range_fetch;
 
 struct range_fetch* range_fetch_start(const char* orig_url, struct zsync_receiver* zr);
 void range_fetch_addranges(struct range_fetch* rf, off_t* ranges, int nranges);
 int range_fetch_perform(struct range_fetch* rf);
+int get_range_block(struct range_fetch* rf, off_t* offset, unsigned char* data, size_t dlen);
 off_t range_fetch_bytes_down(const struct range_fetch* rf);
 void range_fetch_end(struct range_fetch* rf);
 
@@ -41,4 +44,3 @@ void add_auth(char* host, char* user, char* pass);
 
 /* base64.c */
 char* base64(const char*);
-

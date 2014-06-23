@@ -47,12 +47,127 @@
 
 #include <curl/curl.h>
 
+/* socket = connect_to(host, service/port)
+ * Establishes a TCP connection to the named host and port (which can be
+ * supplied as a service name from /etc/services. Returns the socket handle, or
+ * -1 on error. */
+int connect_to(const char *node, const char *service) {
+    struct addrinfo hint;
+    struct addrinfo *ai;
+    int rc;
+
 /* Settings for HTTP connections - auth details */
+    memset(&hint, 0, sizeof hint);
+    hint.ai_family = AF_UNSPEC;
+    hint.ai_socktype = SOCK_STREAM;
+
+    if ((rc = getaddrinfo(node, service, &hint, &ai)) != 0) {
+        perror(node);
+        return -1;
+    }
+    else {
+        struct addrinfo *p;
+        int sd = -1;
+
+        for (p = ai; sd == -1 && p != NULL; p = p->ai_next) {
+            if ((sd =
+                 socket(p->ai_family, p->ai_socktype, p->ai_protocol)) == -1) {
+                perror("socket");
+            }
+            else if (connect(sd, p->ai_addr, p->ai_addrlen) < 0) {
+                perror(node);
+                close(sd);
+                sd = -1;
+            }
+        }
+        freeaddrinfo(ai);
+        return sd;
+    }
+}
+
+/* url = get_location_url(stream, current_url)
+ * Reads the HTTP response from the given stream and extracts the Location
+ * header, making this URL absolute using the current URL. Returned as a
+ * malloced string.
+ * (it ought to be absolute anyway, by the RFC, but many servers send 
+ * relative URIs). */
+char *get_location_url(FILE * f, const char *cur_url) {
+    char buf[1024];
+
+    while (fgets(buf, sizeof(buf), f)) {
+        char *p;
+
+        /* exit if end of headers */
+        if (buf[0] == '\r' || buf[0] == '\n')
+            return NULL;
+
+        /* Look for Location header */
+        p = strchr(buf, ':');
+        if (!p)
+            return NULL;
+        *p++ = 0;
+        if (strcasecmp(buf, "Location"))
+            continue;
+
+        /* Skip leading whitespace */
+        while (*p == ' ')
+            p++;
+
+        {   /* Remove trailing whitespace */
+            char *q = p;
+            while (*q != '\r' && *q != '\n' && *q != ' ' && *q)
+                q++;
+            *q = 0;
+        }
+        if (!*p)
+            return NULL;
+
+        /* Return URL after making absolute */
+        return make_url_absolute(cur_url, p);
+    }
+    return NULL;                // TODO
+}
+
+/* Settings for HTTP connections - proxy host and port, auth details */
+static char *proxy;
+static char *pport;
 static char **auth_details; /* This is a realloced array with 3*num_auth_details entries */
 static int num_auth_details; /* The groups of 3 strings are host, user, pass */
 
 /* Remember .zsync control file URL */
 char *referer;
+
+/* set_proxy_from_string(str)
+ * Sets the proxy settings for HTTP connections to use; these can be either as
+ * a host[:port] or as http://host[:port].
+ * Returns non-zero if the settings were obtained successfully. */
+int set_proxy_from_string(const char *s) {
+    if (!memcmp(s, http_scheme, strlen(http_scheme))) {
+        /* http:// style proxy string */
+        proxy = malloc(256);
+        if (!proxy)
+            return 0;
+        if (!get_http_host_port(s, proxy, 256, &pport))
+            return 0;
+        if (!pport) {
+            pport = strdup("webcache");
+        }
+        return 1;
+    }
+    else {
+        /* host:port style proxy string; have to parse this ourselves */
+        char *p;
+        proxy = strdup(s);
+        p = strchr(proxy, ':');
+        if (!p) {
+            pport = strdup("webcache");
+            return 1;
+        }
+        *p++ = 0;
+        pport = strdup(p);
+        return 1;
+    }
+}
 
 /* Should we tell curl to use a different CA path? */
 char *cacert = NULL;
@@ -87,6 +202,46 @@ void add_auth(char *host, char *user, char *pass) {
     auth_details[num_auth_details * 3 + 2] = pass;
     num_auth_details++;
 }
+
+/* str = get_auth_hdr(host)
+ * For the given host, returns the extra HTTP header(s) that should be included
+ * to provide authentication information. Returned as a malloced string.
+ */
+const char auth_header_tmpl[] = { "Authorization: Basic %s\r\n" };
+
+static char *get_auth_hdr(const char *hn) {
+    /* Find any relevant entry in the auth table */
+    int i;
+    for (i = 0; i < num_auth_details * 3; i += 3) {
+        if (!strcasecmp(auth_details[i], hn)) {
+            char *b;
+            char *header;
+
+            /* We have found an entry in the auth details table for this
+             * hostname; get the user & pass to use */
+            char *u = auth_details[i + 1];
+            char *p = auth_details[i + 2];
+
+            /* Store unencoded user:pass */
+            size_t l = strlen(u) + strlen(p) + 2;
+            char *w = malloc(l);
+            snprintf(w, l, "%s:%s", u, p);
+
+            /* Now base64-encode that, and compose the header */
+            b = base64(w);
+            l = strlen(b) + strlen(auth_header_tmpl) + 1;
+            header = malloc(l);
+            snprintf(header, l, auth_header_tmpl, b);
+
+            /* And clean up */
+            free(w);
+            free(b);
+            return header;
+        }
+    }
+    return NULL;
+}
+
 
 /* Get a curl easy handle based on our global options. Returns NULL on failure */
 CURL *make_curl_handle() {
@@ -285,6 +440,14 @@ FILE *http_get(const char *orig_url, char **track_referer, const char *tfname) {
  *
  * HTTP Range: / 206 response interface
  *
+ * The state engine here is:
+ * If sd == -1, not connected;
+ * else, if block_left is 0
+ *     if boundary is unset, we're reading HTTP headers
+ *     if boundary is set, we're reading a MIME boundary
+ * else we're reading a block of actual data; block_left bytes still to read.
+ *
+ *
  * Procedure:
  *
  * 1) range_fetch_perform resets all the "State for HTTP response parser"
@@ -304,25 +467,40 @@ FILE *http_get(const char *orig_url, char **track_referer, const char *tfname) {
 
 struct range_fetch {
     CURL *curl;     /* Currently open curl handle to the server, or NULL */
-    char *url;      /* URL we're telling curl to use.
-                       Must be kept around after passing it to curl_easy_setopt */
+
+    /* URL we're telling curl to retrieve from, host:port, auth header
+       Must be kept around after passing it to curl_easy_setopt */
+    char *url;
+    char hosth[256];
+    char *authh;
 
     /* zsync_receiver struct that will receive data we get from the remote */
     struct zsync_receiver *zr;
 
+    /* Host and port to connect to (could be the same as the URL, or proxy) */
+    char *chost;
+    char *cport;
+
     /* State for HTTP response parser */
     int http_code;      /* Most recent HTTP status code seen. Reset to 0 for every curl request. */
+    int sd;         /* Currently open socket to the server, or -1 */
     char *boundary;     /* If we're expecting a mime/multipart response, this is the boundary string. */
     int multipart;      /* If we're reading a MIME multipart delimiter, the line number we're on
                            1  = "--boundary" line
                            2+ = Headers */
+
+    /* State for block currently being read */
     size_t block_left;  /* non-zero if we're in the middle of reading a block */
     off_t offset;       /* and this is the offset of the start of the block we are reading */
-    char buf[2048];     /* Buffering of MIME multipart delimiter lines from the remote server */
-    int buf_end;        /* Bytes 0 .. buf_end-1 in buf[] are valid */
+
+    /* Buffering of data from the remote server */
+    char buf[4096];
+    int buf_start, buf_end; /* Bytes buf_start .. buf_end-1 in buf[] are valid */
 
     /* Keep count of total bytes retrieved */
     off_t bytes_down;
+
+    int server_close; /* 0: can send more, 1: cannot send more (but one set of headers still to read), 2: cannot send more and all existing headers read */
 
     /* Byte ranges to fetch */
     off_t *ranges_todo; /* Contains 2*nranges ranges, consisting of start and stop offset */
@@ -387,9 +565,12 @@ int range_fetch_sockoptcallback( void *clientp, curl_socket_t curlfd, curlsockty
 /* Curl HEADERFUNCTION. Gets headers one-by-one (including the HTTP status line) plus a range_fetch struct. */
 size_t range_fetch_read_http_headers( void *ptr, size_t size, size_t nmemb, void *userdata ) {
     struct range_fetch *rf = (struct range_fetch *)userdata;
+    char buf[512];
     char *buf = (char *)ptr;
     size_t len = size * nmemb;
     char *end = buf + len;
+    int status;
+    int seen_location = 0;
 
     /* Keep bytes_down up-to-date */
     rf->bytes_down += len;
@@ -407,6 +588,7 @@ size_t range_fetch_read_http_headers( void *ptr, size_t size, size_t nmemb, void
         /* Remember most recent HTTP code */
         rf->http_code = (int)(buf[9]-'0')*100 + (int)(buf[10]-'0')*10 + (int)(buf[11]-'0');
     }
+
 
     /* HTTP 200 + Content-Length -> Entire file */
     else if( rf->http_code == 200 && len > strlen("content-length: x") && strncasecmp(buf, "content-length: ", strlen("content-length: ")) == 0) {
@@ -479,7 +661,7 @@ size_t range_fetch_read_http_headers( void *ptr, size_t size, size_t nmemb, void
                 p++;
             }
 
-            /* Copy until the of the boundary */
+            /* Copy until the end of the boundary */
             while( p < end ) {
                 if( *p == 0 )
                     break;
@@ -500,7 +682,277 @@ size_t range_fetch_read_http_headers( void *ptr, size_t size, size_t nmemb, void
         }
     }
 
+    {                           /* read status line */
+        char *p;
+
+        if (rfgets(buf, sizeof(buf), rf) == NULL)
+            return -1;
+        if (buf[0] == 0)
+            return 0;           /* EOF, caller decides if that's an error */
+        if (memcmp(buf, "HTTP/1", 6) != 0 || (p = strchr(buf, ' ')) == NULL) {
+            fprintf(stderr, "got non-HTTP response '%s'\n", buf);
+            return -1;
+        }
+        status = atoi(p + 1);
+        if (status != 206 && status != 301 && status != 302) {
+            if (status >= 300 && status < 400) {
+                fprintf(stderr,
+                        "\nzsync received a redirect/further action required status code: %d\nzsync specifically refuses to proceed when a server requests further action. This is because zsync makes a very large number of requests per file retrieved, and so if zsync has to perform additional actions per request, it further increases the load on the target server. The person/entity who created this zsync file should change it to point directly to a URL where the target file can be retrieved without additional actions/redirects needing to be followed.\nSee http://zsync.moria.orc.uk/server-issues\n",
+                        status);
+            }
+            else if (status == 200) {
+                fprintf(stderr,
+                        "\nzsync received a data response (code %d) but this is not a partial content response\nzsync can only work with servers that support returning partial content from files. The person/entity creating this .zsync has tried to use a server that is not returning partial content. zsync cannot be used with this server.\nSee http://zsync.moria.orc.uk/server-issues\n",
+                        status);
+            }
+            else {
+                /* generic error message otherwise */
+                fprintf(stderr, "bad status code %d\n", status);
+            }
+            return -1;
+        }
+        if (*(p - 1) == '0') {  /* HTTP/1.0 server? */
+            rf->server_close = 2;
+        }
+    }
+
+    /* Read other headers */
+    while (1) {
+        char *p;
+
+        /* Get next line */
+        if (rfgets(buf, sizeof(buf), rf) == NULL)
+            return -1;
+
+        /* If it's the end of the headers */
+        if (buf[0] == '\r' || buf[0] == '\0') {
+            /* We are happy provided we got the block boundary, or an actual block is starting. */
+            if (((rf->boundary || rf->block_left)
+                 && !(rf->boundary && rf->block_left))
+                || (status >= 300 && status < 400 && seen_location))
+                return status;
+            break;
+        }
+
+        /* Parse header */
+        p = strstr(buf, ": ");
+        if (!p)
+            break;
+        *p = 0;
+        p += 2;
+        buflwr(buf);
+        {   /* Remove the trailing \r\n from the value */
+            int len = strcspn(p, "\r\n");
+            p[len] = 0;
+        }
+        /* buf is the header name (lower-cased), p the value */
+        /* Switch based on header */
+
+        /* If remote closes the connection on us, record that */
+        if (!strcmp(buf, "connection") && !strcmp(p, "close")) {
+            rf->server_close = 2;
+        }
+
+        if (status == 206 && !strcmp(buf, "content-range")) {
+            /* Okay, we're getting a non-MIME block from the remote. Get the
+             * range and set our state appropriately */
+            off_t from, to;
+            sscanf(p, "bytes " OFF_T_PF "-" OFF_T_PF "/", &from, &to);
+            if (from <= to) {
+                rf->block_left = to + 1 - from;
+                rf->offset = from;
+            }
+
+            /* Can only have got one range. */
+            rf->rangesdone++;
+            rf->rangessent = rf->rangesdone;
+        }
+
+        /* If we're about to get a MIME multipart block set */
+        if (status == 206 && !strcasecmp(buf, "content-type")
+            && !strncasecmp(p, "multipart/byteranges", 20)) {
+
+            /* Get the multipart boundary string */
+            char *q = strstr(p, "boundary=");
+            if (!q)
+                break;
+            q += 9;
+
+            /* Gah, we could really use a regexp here. Could be quoted... */
+            if (*q == '"') {
+                rf->boundary = strdup(q + 1);
+                q = strchr(rf->boundary, '"');
+                if (q)
+                    *q = 0;
+            }
+            else {  /* or unquoted */
+                rf->boundary = strdup(q);
+                q = rf->boundary + strlen(rf->boundary) - 1;
+
+                while (*q == '\r' || *q == ' ' || *q == '\n')
+                    *q-- = '\0';
+            }
+        }
+
+        /* If remote is telling us to change URL */
+        if ((status == 302 || status == 301)
+            && !strcmp(buf, "location")) {
+            if (seen_location++) {
+                fprintf(stderr, "Error: multiple Location headers on redirect\n");
+                break;
+            }
+
+            /* Set new target URL 
+             * NOTE: we are violating the "the client SHOULD continue to use
+             * the Request-URI for future requests" of RFC2616 10.3.3 for 302s.
+             * It's not practical given the number of requests we are making to
+             * follow the RFC here, and at least we're only remembering it for
+             * the duration of this transfer. */
+            if (!no_progress)
+                fprintf(stderr, "followed redirect to %s\n", p);
+            range_fetch_set_url(rf, p);
+
+            /* Flag caller to reconnect; the new URL might be a new target. */
+            rf->server_close = 2;
+        }
+        /* No other headers that we care about. In particular:
+         *
+         * FIXME: non-conformant to HTTP/1.1 because we ignore
+         * Transfer-Encoding: chunked.
+         */
+    }
+    status = -1;
     return len;
+}
+
+/* range_fetch_set_url(rf, url)
+ * Set up a range_fetch to fetch from a given URL. Private method. 
+ * C is a nightmare for memory allocation here. At least the errors should be
+ * caught, but minor memory leaks may occur on some error paths. */
+static int range_fetch_set_url(struct range_fetch* rf, const char* orig_url) {
+    /* Get the host, port and path from the URL. */
+    char hostn[sizeof(rf->hosth)];
+    char* cport;
+    char* p = get_http_host_port(orig_url, hostn, sizeof(hostn), &cport);
+    if (!p) {
+        return 0;
+    }
+
+    free(rf->url);
+    if (rf->authh) free(rf->authh);
+
+    /* Get host:port for Host: header */
+    if (strcmp(cport, "http") != 0)
+        snprintf(rf->hosth, sizeof(rf->hosth), "%s:%s", hostn, cport);
+    else
+        snprintf(rf->hosth, sizeof(rf->hosth), "%s", hostn);
+
+    if (proxy) {
+        /* URL must be absolute; don't need cport anymore, just need full URL
+         * to give to proxy. */
+        free(cport);
+        rf->url = strdup(orig_url);
+    }
+    else {
+        free(rf->cport);
+        free(rf->chost);
+        // Set url to relative part and chost, cport to the target
+        if ((rf->chost = strdup(hostn)) == NULL) {
+            free(cport);
+            return 0;
+        }
+        rf->cport = cport;
+        rf->url = strdup(p);
+    }
+
+    /* Get any auth header that we should use */
+    rf->authh = get_auth_hdr(hostn);
+
+    return !!rf->url;
+}
+
+/* get_more_data - this is the method which owns all reads from the remote.
+ * Nothing else reads from the remote. This buffers data, so that the
+ * higher-level methods below can easily read whole lines from the remote. 
+ * The higher-level methods call this function when they need more data: 
+ * it refills the buffer with data from the network. Returns the bytes read. */
+static int get_more_data(struct range_fetch *rf) {
+    /* First, garbage collect - move the 'live' data in the buffer to the start
+     * of the buffer. */
+    if (rf->buf_start) {
+        memmove(rf->buf, &(rf->buf[rf->buf_start]),
+                rf->buf_end - rf->buf_start);
+        rf->buf_end -= rf->buf_start;
+        rf->buf_start = 0;
+    }
+
+    {   /* Read as much as the OS wants to give us, up to a limit of filling
+         * the rest of the buffer; ignore EINTR. */
+        int n;
+        do {
+            n = read(rf->sd, &(rf->buf[rf->buf_end]),
+                     sizeof(rf->buf) - rf->buf_end);
+        } while (n == -1 && errno == EINTR);
+        if (n < 0) {
+            perror("read");
+        }
+        else {
+
+            /* Add new bytes to buffer, and update total bytes count */
+            rf->buf_end += n;
+            rf->bytes_down += n;
+        }
+        return n;
+    }
+}
+
+/* rfgets - get next line from the remote (terminated by LF or end-of-file)
+ * (using the buffer, fetching more data if there's no full line in the buffer
+ * yet) */
+static char *rfgets(char *buf, size_t len, struct range_fetch *rf) {
+    char *p;
+    while (1) {
+        /* Look for a line end in the in buffer */
+        p = memchr(rf->buf + rf->buf_start, '\n', rf->buf_end - rf->buf_start);
+
+        /* If we don't have the end of the line yet, fetch more data into the
+         * buffer (and go around again) */
+        if (!p) {
+            int n = get_more_data(rf);
+            if (n <= 0) {
+                /* EOF - just return all that we have left */
+                p = &(rf->buf[rf->buf_end]);
+            }
+        }
+        else    /* We have a \n; set p to point just past it */
+            p++;
+
+        if (p) {
+            register char *bufstart = &(rf->buf[rf->buf_start]);
+
+            /* Work out how much data to return - the line, or at most 'len' bytes */
+            len--;              /* leave space for trailing \0 */
+            if (len > (size_t) (p - bufstart))
+                len = p - bufstart;
+
+            /* Copy from input buffer to return buffer, nul terminate, and advance
+             * current position in the input buffer */
+            memcpy(buf, bufstart, len);
+            buf[len] = 0;
+            rf->buf_start += len;
+            return buf;
+        }
+    }
+}
+
+/* buflwr(str) - in-place convert this string to lower case */
+static void buflwr(char *s) {
+    char c;
+    while ((c = *s) != 0) {
+        if (c >= 'A' && c <= 'Z')
+            *s = c - 'A' + 'a';
+        s++;
+    }
 }
 
 /* Curl WRITEFUNCTION. Gets response data in batches, plus a range_fetch struct. */
@@ -672,10 +1124,26 @@ struct range_fetch *range_fetch_start(const char *orig_url, struct zsync_receive
     /* Copy pointer to zsync_receiver */
     rf->zr = zr;
 
+    /* If going through a proxy, we can immediately set up the host and port to
+     * connect to */
+    if (proxy) {
+        rf->cport = strdup(pport);
+        rf->chost = strdup(proxy);
+    }
+    else {
+        rf->cport = NULL;
+        rf->chost = NULL;
+    }
+    /* Blank initialisation for other fields before set_url call */
+    rf->url = NULL;
+    rf->authh = NULL;
+
     /* Init curl handle */
     rf->curl = make_curl_handle();
-    if (!rf->curl) {
+    if (!rf->curl || !range_fetch_set_url(rf, orig_url)) {
         /* make_curl_handle already printed an error message */
+        free(rf->cport);
+        free(rf->chost);
         free(rf);
         return NULL;
     }
@@ -695,6 +1163,7 @@ struct range_fetch *range_fetch_start(const char *orig_url, struct zsync_receive
     rf->boundary = NULL;
     rf->multipart = 0;
     rf->buf_end = 0;    /* Buffer initially empty */
+    rf->sd = -1;                        /* Socket not open */
     rf->ranges_todo = NULL;             /* And no ranges given yet */
     rf->nranges = rf->rangessent = rf->rangesdone = 0;
 
@@ -737,10 +1206,101 @@ off_t range_fetch_bytes_down(const struct range_fetch * rf) {
 /* Destructor */
 void range_fetch_end(struct range_fetch *rf) {
     curl_easy_cleanup( rf->curl );
+    if (rf->sd != -1)
+        close(rf->sd);
     free(rf->ranges_todo);
     free(rf->boundary);
     free(rf->url);
+    free(rf->cport);
+    free(rf->chost);
     free(rf);
+}
+
+/* range_fetch_connect
+ * Connect this rf to its remote server */
+static void range_fetch_connect(struct range_fetch *rf) {
+    rf->sd = connect_to(rf->chost, rf->cport);
+    rf->server_close = 0;
+    rf->rangessent = rf->rangesdone;
+    rf->buf_start = rf->buf_end = 0;    /* Buffer initially empty */
+}
+
+/* range_fetch_getmore
+ * On a connected range fetch, send another request to the remote */
+static void range_fetch_getmore(struct range_fetch *rf) {
+    char request[2048];
+    int l;
+    int max_range_per_request = 20;
+    char request[1024] = { 0 }; /* Range like "X-Y,N-M" */
+
+    /* Only if there's stuff queued to get */
+    if (rf->rangessent == rf->nranges)
+        return;
+
+    /* Build the base request, everything up to the Range: bytes= */
+    snprintf(request, sizeof(request),
+             "GET %s HTTP/1.1\r\n"
+             "User-Agent: zsync/" VERSION "\r\n"
+             "Host: %s"
+             "%s%s\r\n"
+             "%s"
+             "Range: bytes=",
+             rf->url, rf->hosth,
+             referer ? "\r\nReferer: " : "", referer ? referer : "",
+             rf->authh ? rf->authh : "");
+
+    /* The for loop here is just a sanity check, lastrange is the real loop control */
+    for (; rf->rangessent < rf->nranges;) {
+        int i = rf->rangessent;
+        int lastrange = 0;
+        int chars;
+        int l;
+
+        /* Add at least one byterange to the request; but is this the last one?
+         * That's decided based on whether there are any more to add, whether
+         * we've reached our self-imposed limit per request, and whether
+         * there's buffer space to add more.
+         */
+        l = strlen(request);
+        if (l > 1200 || !(--max_range_per_request) || i == rf->nranges - 1)
+            lastrange = 1;
+
+        /* Append to the request */
+        snprintf(request + l, sizeof(request) - l, OFF_T_PF "-" OFF_T_PF "%s",
+                 rf->ranges_todo[2 * i], rf->ranges_todo[2 * i + 1],
+                 lastrange ? "" : ",");
+
+        /* And record that we have sent this one */
+        rf->rangessent++;
+
+        /* Exit loop if that is the last to add */
+        if (lastrange)
+            break;
+    }
+    l = strlen(request);
+
+    /* Possibly close the connection (and record the fact, so we definitely
+     * don't send more stuff) if this is the last */
+    snprintf(request + l, sizeof(request) - l, "\r\n%s\r\n",
+             rf->rangessent == rf->nranges ? (rf->server_close =
+                                              1, "Connection: close\r\n") : "");
+
+    {   /* Send the request */
+        size_t len = strlen(request);
+        char *p = request;
+        int r = 0;
+
+        while (len > 0
+               && ((r = send(rf->sd, p, len, 0)) != -1 || errno == EINTR)) {
+            if (r >= 0) {
+                p += r;
+                len -= r;
+            }
+        }
+        if (r == -1) {
+            perror("send");
+        }
+    }
 }
 
 /* Return:
